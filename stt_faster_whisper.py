@@ -11,13 +11,15 @@ import numpy as np
 print(f"[DEBUG] numpy imported ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 import torchaudio
 print(f"[DEBUG] torchaudio imported ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
+import librosa
+print(f"[DEBUG] librosa imported ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 from faster_whisper import WhisperModel
 print(f"[DEBUG] faster_whisper imported ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
 print("[DEBUG] Finished all imports", flush=True)
 
 try:
-  model_dir = "/home/hans/dev/GPT/models/Systran/faster-whisper-large-v3"
+  model_dir  = "/home/hans/dev/GPT/models/Systran/faster-whisper-large-v3"
   audio_path = "/home/hans/dev/GPT/data/test01.m4a"
   print(f"[DEBUG] Paths set ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
@@ -30,22 +32,22 @@ try:
   model = WhisperModel(model_dir, compute_type="int8")
   print(f"[DEBUG] Model loaded ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
-  waveform, sample_rate = torchaudio.load(audio_path)
-  if sample_rate != 16000:
-    resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
-    waveform = resampler(waveform)
-  print(f"[DEBUG] Audio loaded & resampled ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
+  audio, sr = librosa.load(audio_path, sr=16000)
+  print(f"[DEBUG] Audio loaded with librosa ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
-  audio_np = waveform.squeeze().numpy().astype(np.float32)
-  print(f"[DEBUG] Converted to numpy ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
-
-  chunk_size = 32000 * 2  # 2 seconds @ 16kHz
-  num_chunks = len(audio_np) // chunk_size + (1 if len(audio_np) % chunk_size != 0 else 0)
+  chunk_duration = 30
+  chunk_samples  = chunk_duration * 16000
+  total_samples  = len(audio)
+  num_chunks     = total_samples // chunk_samples + (1 if total_samples % chunk_samples != 0 else 0)
 
   print(f"[DEBUG] Starting chunked transcription: {num_chunks} chunks", flush=True)
+
   for i in range(num_chunks):
-    chunk = audio_np[i*chunk_size:(i+1)*chunk_size]
-    chunk_start = i * 2.0
+    start_sample = i * chunk_samples
+    end_sample   = min(start_sample + chunk_samples, total_samples)
+    chunk        = audio[start_sample:end_sample].astype(np.float32)
+    chunk_start  = i * chunk_duration
+
     try:
       segments, _ = model.transcribe(chunk, language="en", vad_filter=True, word_timestamps=True)
       for segment in segments:
