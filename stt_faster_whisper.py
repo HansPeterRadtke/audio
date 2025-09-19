@@ -37,14 +37,21 @@ try:
   audio, sr = librosa.load(audio_path, sr=16000)
   print(f"[DEBUG] Audio loaded with librosa ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
+  txt_path = os.path.splitext(audio_path)[0] + ".txt"
+  try:
+    output_file = open(txt_path, "w", encoding="utf-8")
+    print(f"[DEBUG] Created output file: {txt_path}", flush=True)
+  except Exception as e:
+    print(f"[ERROR] Failed to create output file: {txt_path}", flush=True)
+    traceback.print_exc()
+    raise
+
   chunk_duration = 30
   chunk_samples  = chunk_duration * 16000
   total_samples  = len(audio)
   num_chunks     = total_samples // chunk_samples + (1 if total_samples % chunk_samples != 0 else 0)
 
   print(f"[DEBUG] Starting chunked transcription: {num_chunks} chunks", flush=True)
-
-  text_output = []
 
   for i in range(num_chunks):
     start_sample = i * chunk_samples
@@ -55,23 +62,17 @@ try:
     try:
       segments, _ = model.transcribe(chunk, language="en", vad_filter=True, word_timestamps=True)
       for segment in segments:
-        text_output.append(segment.text)
+        output_file.write(segment.text + "\n")
         print(f"[{chunk_start + segment.start:.2f}s -> {chunk_start + segment.end:.2f}s] {segment.text}", flush=True)
     except Exception as e:
       print(f"[ERROR] Exception during chunk {i}: {e}", flush=True)
       traceback.print_exc()
 
-  # Write to .txt file safely
   try:
-    txt_path = os.path.splitext(audio_path)[0] + ".txt"
-    print(f"[DEBUG] Attempting to write transcription to: {txt_path}", flush=True)
-    with open(txt_path, "w", encoding="utf-8") as f:
-      f.write("\n".join(text_output))
-    print(f"[DEBUG] Transcription successfully written to: {txt_path}", flush=True)
-    print("[DEBUG] Preview of output:", flush=True)
-    print("\n".join(text_output[:3]), flush=True)
+    output_file.close()
+    print(f"[DEBUG] Output file closed: {txt_path}", flush=True)
   except Exception as e:
-    print(f"[ERROR] Failed to write output file: {e}", flush=True)
+    print(f"[ERROR] Failed to close output file: {txt_path}", flush=True)
     traceback.print_exc()
 
 except Exception as e:
