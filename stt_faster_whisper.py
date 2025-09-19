@@ -20,7 +20,8 @@ print("[DEBUG] Finished all imports", flush=True)
 
 try:
   model_dir  = "/home/hans/dev/GPT/models/Systran/faster-whisper-large-v3"
-  audio_path = "/home/hans/dev/GPT/data/test01.m4a"
+#  audio_path = "/home/hans/dev/GPT/data/test01.m4a"
+  audio_path = "/home/hans/dev/GPT/data/audio.mp3"
   print(f"[DEBUG] Paths set ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
   if not os.path.exists(model_dir):

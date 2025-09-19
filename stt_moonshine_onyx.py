@@ -19,7 +19,7 @@ print(f"[DEBUG] transformers imported ({time.time() - t0:.3f}s)", flush=True); t
 print("[DEBUG] Finished all imports", flush=True)
 
 try:
-  model_dir  = "/home/hans/dev/GPT/models/onnx-community/moonshine-base-ONNX"
+  model_dir  = "/home/hans/dev/GPT/models/github/audio/models/usefulsensors/moonshine-onyx"
   onnx_dir   = os.path.join(model_dir, "onnx")
   audio_path = "/home/hans/dev/GPT/data/test01.m4a"
   print(f"[DEBUG] Paths set ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
