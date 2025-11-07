@@ -20,7 +20,7 @@ print("[DEBUG] Finished all imports", flush=True)
 
 try:
   default_audio_path = "/home/hans/dev/GPT/data/test01.m4a"
-  model_dir          = "/home/hans/dev/GPT/models/Systran/faster-whisper-large-v3"
+  model_dir          = "/srv/data/models/Systran/faster-whisper-large-v3"
 
   audio_path = os.sys.argv[1] if len(os.sys.argv) > 1 else default_audio_path
   print(f"[DEBUG] Audio path set to: {audio_path}", flush=True)
@@ -31,7 +31,7 @@ try:
     raise FileNotFoundError(f"Audio file not found: {audio_path}")
   print(f"[DEBUG] Path checks done ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
-  model = WhisperModel(model_dir, compute_type="int8")
+  model = WhisperModel(model_dir, compute_type="int8", cpu_threads=4)
   print(f"[DEBUG] Model loaded ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
   audio, sr = librosa.load(audio_path, sr=16000)
@@ -45,6 +45,11 @@ try:
     print(f"[ERROR] Failed to create output file: {txt_path}", flush=True)
     traceback.print_exc()
     raise
+
+  detect_samples   = min(len(audio), 30 * 16000)
+  _, info = model.transcribe(audio[:detect_samples], language=None, task="transcribe", vad_filter=True)
+  lang = info.language
+  print(f"[DEBUG] Detected language: {lang} ({getattr(info,'language_probability',None)})", flush=True)
 
   chunk_duration = 30
   chunk_samples  = chunk_duration * 16000
@@ -60,9 +65,10 @@ try:
     chunk_start  = i * chunk_duration
 
     try:
-      segments, _ = model.transcribe(chunk, language="en", vad_filter=True, word_timestamps=True)
+      segments, _ = model.transcribe(chunk, language=lang, task="transcribe", vad_filter=True, word_timestamps=True)
       for segment in segments:
         output_file.write(segment.text + "\n")
+        output_file.flush()
         print(f"[{chunk_start + segment.start:.2f}s -> {chunk_start + segment.end:.2f}s] {segment.text}", flush=True)
     except Exception as e:
       print(f"[ERROR] Exception during chunk {i}: {e}", flush=True)
