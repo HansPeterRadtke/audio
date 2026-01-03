@@ -20,7 +20,7 @@ print("[DEBUG] Finished all imports", flush=True)
 
 try:
   default_audio_path = "/home/hans/dev/GPT/data/test01.m4a"
-  model_dir          = "/srv/data/models/Systran/faster-whisper-large-v3"
+  model_dir          = "/data/models/Systran/faster-whisper-large-v3"
 
   audio_path = os.sys.argv[1] if len(os.sys.argv) > 1 else default_audio_path
   print(f"[DEBUG] Audio path set to: {audio_path}", flush=True)
@@ -31,7 +31,7 @@ try:
     raise FileNotFoundError(f"Audio file not found: {audio_path}")
   print(f"[DEBUG] Path checks done ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
-  model = WhisperModel(model_dir, compute_type="int8", cpu_threads=4)
+  model = WhisperModel(model_dir, device="cuda", compute_type="int8_float16")
   print(f"[DEBUG] Model loaded ({time.time() - t0:.3f}s)", flush=True); t0 = time.time()
 
   audio, sr = librosa.load(audio_path, sr=16000)
