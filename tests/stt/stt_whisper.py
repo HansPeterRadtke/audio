@@ -1,32 +1,37 @@
 import os
+import sys
+import argparse
 import traceback
 import torch
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import torchaudio
 import time
 
+DEFAULT_MODEL = "openai/whisper-base"
+DEFAULT_AUDIO = "/data/tmp/test_100_words.wav"
+
 start_all = time.time()
 print("[DEBUG] Starting STT script")
 
 try:
-  t0 = time.time()
-  model_dir = "/home/hans/dev/GPT/models/whisper-base"
-  audio_path = "/home/hans/dev/GPT/data/test01.m4a"
-  print(f"[DEBUG] Paths set ({time.time() - t0:.3f}s)")
+  parser = argparse.ArgumentParser(description="Whisper STT using HuggingFace transformers")
+  parser.add_argument("audio", nargs="?", default=DEFAULT_AUDIO, help="Audio file path")
+  parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name or path")
+  args = parser.parse_args()
 
   t0 = time.time()
-  if not os.path.exists(model_dir):
-    raise FileNotFoundError(f"Model directory not found: {model_dir}")
+  model_id = args.model
+  audio_path = args.audio
+  print(f"[DEBUG] Model: {model_id}, Audio: {audio_path}")
+
+  t0 = time.time()
   if not os.path.isfile(audio_path):
     raise FileNotFoundError(f"Audio file not found: {audio_path}")
   print(f"[DEBUG] Path checks done ({time.time() - t0:.3f}s)")
 
-  os.environ["TRANSFORMERS_OFFLINE"] = "1"
-  os.environ["HF_DATASETS_OFFLINE"] = "1"
-
   t0 = time.time()
-  processor = WhisperProcessor.from_pretrained(model_dir, local_files_only=True)
-  model     = WhisperForConditionalGeneration.from_pretrained(model_dir, local_files_only=True)
+  processor = WhisperProcessor.from_pretrained(model_id)
+  model     = WhisperForConditionalGeneration.from_pretrained(model_id)
   model.eval()
   print(f"[DEBUG] Model load complete ({time.time() - t0:.3f}s)")
 
