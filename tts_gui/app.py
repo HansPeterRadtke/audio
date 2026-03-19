@@ -26,8 +26,44 @@ BIN_ROOT = DATA_ROOT / "bin"
 HOSTS_ROOT = DATA_ROOT / "etc" / "hosts"
 PORTS_PATH = DATA_ROOT / "etc" / "ports.json"
 TMP_ROOT = DATA_ROOT / "var" / "tmp" / "tts_gui"
+RAM_TMP_ROOT = Path("/dev/shm/tts_gui")
 
 ENGINE_OPTIONS = ("auto", "index", "fish", "cosy", "miotts", "piper")
+
+ENGINE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "auto": {},
+    "index": {
+        "no_speaker": False,
+    },
+    "fish": {
+        "no_speaker": False,
+        "prompt_text": "",
+        "chunk_length": "",
+        "temperature": "",
+        "top_p": "",
+        "repetition_penalty": "",
+        "max_new_tokens": "",
+        "max_length": "",
+        "split_sentences": True,
+        "chunk_chars": "",
+        "speaker_seconds": "",
+        "speaker_offset": "",
+    },
+    "cosy": {
+        "no_speaker": False,
+        "prompt_text": "",
+    },
+    "miotts": {
+        "no_speaker": False,
+    },
+    "piper": {
+        "speaker_id": "0",
+        "length_scale": "",
+        "noise_scale": "",
+        "noise_w": "",
+        "sentence_silence": "",
+    },
+}
 
 
 def bootstrap_audio_env() -> None:
@@ -108,23 +144,6 @@ def current_sink_name() -> str:
     return "unknown"
 
 
-def play_wav(path: Path) -> None:
-    bootstrap_audio_env()
-    candidates = (
-        ("paplay", [str(path)]),
-        ("pw-play", [str(path)]),
-        ("aplay", [str(path)]),
-        ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "error", str(path)]),
-        ("cvlc", ["--play-and-exit", "--intf", "dummy", str(path)]),
-    )
-    env = os.environ.copy()
-    for cmd, args in candidates:
-        if shutil.which(cmd):
-            subprocess.run([cmd, *args], check=True, env=env)
-            return
-    raise RuntimeError("no audio playback command found")
-
-
 def wav_duration(path: Path) -> float:
     with wave.open(str(path), "rb") as handle:
         rate = handle.getframerate() or 1
@@ -183,6 +202,8 @@ class TTSGui(tk.Tk):
         self.geometry("1240x860")
         self.minsize(1100, 760)
 
+        if RAM_TMP_ROOT.parent.is_dir():
+            RAM_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -192,10 +213,17 @@ class TTSGui(tk.Tk):
         self.engine_var = tk.StringVar(value="auto")
         self.mode_var = tk.StringVar(value="server")
         self.no_speaker_var = tk.BooleanVar(value=False)
-        self.save_output_var = tk.BooleanVar(value=False)
-        self.style_var = tk.StringVar()
         self.prompt_var = tk.StringVar()
         self.chunk_length_var = tk.StringVar()
+        self.temperature_var = tk.StringVar()
+        self.top_p_var = tk.StringVar()
+        self.repetition_penalty_var = tk.StringVar()
+        self.max_new_tokens_var = tk.StringVar()
+        self.max_length_var = tk.StringVar()
+        self.split_sentences_var = tk.BooleanVar(value=True)
+        self.chunk_chars_var = tk.StringVar()
+        self.speaker_seconds_var = tk.StringVar()
+        self.speaker_offset_var = tk.StringVar()
         self.piper_model_var = tk.StringVar()
         self.piper_speaker_id_var = tk.StringVar(value="0")
         self.piper_length_scale_var = tk.StringVar()
@@ -203,7 +231,7 @@ class TTSGui(tk.Tk):
         self.piper_noise_w_var = tk.StringVar()
         self.piper_sentence_silence_var = tk.StringVar()
         self.speaker_var = tk.StringVar()
-        self.output_path_var = tk.StringVar(value="/data/tmp/tts_gui.wav")
+        self.save_path_var = tk.StringVar(value="/data/tmp/tts_gui.wav")
         self.server_status_var = tk.StringVar(value="Server: checking...")
         self.server_detail_var = tk.StringVar(value="")
         self.sink_var = tk.StringVar(value=f"Sink: {current_sink_name()}")
@@ -225,9 +253,10 @@ class TTSGui(tk.Tk):
 
         self._build_ui()
         self._refresh_voice_lists()
-        self.engine_var.trace_add("write", lambda *_: self._sync_option_visibility())
+        self._apply_engine_defaults(self.engine_var.get().strip() or "auto")
+        self._sync_option_visibility()
+        self.engine_var.trace_add("write", lambda *_: self._on_engine_changed())
         self.no_speaker_var.trace_add("write", lambda *_: self._sync_option_visibility())
-        self.save_output_var.trace_add("write", lambda *_: self._sync_output_widgets())
         self.after(100, self._poll_log_queue)
         self.after(150, self._periodic_status_refresh)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -272,11 +301,6 @@ class TTSGui(tk.Tk):
         self.engine_combo = ttk.Combobox(opts, textvariable=self.engine_var, values=ENGINE_OPTIONS, state="readonly")
         self.engine_combo.grid(row=0, column=3, sticky="ew")
 
-        self.save_output_check = ttk.Checkbutton(opts, text="Save output", variable=self.save_output_var)
-        self.save_output_check.grid(row=0, column=4, sticky="w", padx=(12, 0))
-        self.output_entry = ttk.Entry(opts, textvariable=self.output_path_var)
-        self.output_entry.grid(row=0, column=5, sticky="ew")
-
         self.speaker_label = ttk.Label(opts, text="Reference voice")
         self.speaker_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.speaker_combo = ttk.Combobox(opts, textvariable=self.speaker_var, state="readonly")
@@ -291,40 +315,74 @@ class TTSGui(tk.Tk):
         self.piper_model_combo = ttk.Combobox(opts, textvariable=self.piper_model_var, state="readonly")
         self.piper_model_combo.grid(row=1, column=5, sticky="ew", pady=(8, 0))
 
-        self.style_label = ttk.Label(opts, text="Style")
-        self.style_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.style_entry = ttk.Entry(opts, textvariable=self.style_var)
-        self.style_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
         self.prompt_label = ttk.Label(opts, text="Prompt text")
-        self.prompt_label.grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.prompt_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.prompt_entry = ttk.Entry(opts, textvariable=self.prompt_var)
-        self.prompt_entry.grid(row=2, column=3, sticky="ew", pady=(8, 0))
+        self.prompt_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
         self.chunk_label = ttk.Label(opts, text="Chunk length")
-        self.chunk_label.grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.chunk_label.grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
         self.chunk_entry = ttk.Entry(opts, textvariable=self.chunk_length_var)
-        self.chunk_entry.grid(row=2, column=5, sticky="ew", pady=(8, 0))
+        self.chunk_entry.grid(row=2, column=3, sticky="ew", pady=(8, 0))
+
+        self.temperature_label = ttk.Label(opts, text="Temperature")
+        self.temperature_label.grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.temperature_entry = ttk.Entry(opts, textvariable=self.temperature_var)
+        self.temperature_entry.grid(row=2, column=5, sticky="ew", pady=(8, 0))
+
+        self.top_p_label = ttk.Label(opts, text="Top P")
+        self.top_p_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.top_p_entry = ttk.Entry(opts, textvariable=self.top_p_var)
+        self.top_p_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.repetition_penalty_label = ttk.Label(opts, text="Repetition penalty")
+        self.repetition_penalty_label.grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.repetition_penalty_entry = ttk.Entry(opts, textvariable=self.repetition_penalty_var)
+        self.repetition_penalty_entry.grid(row=3, column=3, sticky="ew", pady=(8, 0))
+        self.max_new_tokens_label = ttk.Label(opts, text="Max new tokens")
+        self.max_new_tokens_label.grid(row=3, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.max_new_tokens_entry = ttk.Entry(opts, textvariable=self.max_new_tokens_var)
+        self.max_new_tokens_entry.grid(row=3, column=5, sticky="ew", pady=(8, 0))
+
+        self.max_length_label = ttk.Label(opts, text="Max length")
+        self.max_length_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.max_length_entry = ttk.Entry(opts, textvariable=self.max_length_var)
+        self.max_length_entry.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        self.split_sentences_check = ttk.Checkbutton(opts, text="Split sentences", variable=self.split_sentences_var)
+        self.split_sentences_check.grid(row=4, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.chunk_chars_label = ttk.Label(opts, text="Chunk chars")
+        self.chunk_chars_label.grid(row=4, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.chunk_chars_entry = ttk.Entry(opts, textvariable=self.chunk_chars_var)
+        self.chunk_chars_entry.grid(row=4, column=5, sticky="ew", pady=(8, 0))
+
+        self.speaker_seconds_label = ttk.Label(opts, text="Speaker seconds")
+        self.speaker_seconds_label.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.speaker_seconds_entry = ttk.Entry(opts, textvariable=self.speaker_seconds_var)
+        self.speaker_seconds_entry.grid(row=5, column=1, sticky="ew", pady=(8, 0))
+        self.speaker_offset_label = ttk.Label(opts, text="Speaker offset")
+        self.speaker_offset_label.grid(row=5, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.speaker_offset_entry = ttk.Entry(opts, textvariable=self.speaker_offset_var)
+        self.speaker_offset_entry.grid(row=5, column=3, sticky="ew", pady=(8, 0))
 
         self.piper_speaker_id_label = ttk.Label(opts, text="Piper speaker-id")
-        self.piper_speaker_id_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.piper_speaker_id_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
         self.piper_speaker_id_entry = ttk.Entry(opts, textvariable=self.piper_speaker_id_var)
-        self.piper_speaker_id_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.piper_speaker_id_entry.grid(row=6, column=1, sticky="ew", pady=(8, 0))
         self.piper_length_scale_label = ttk.Label(opts, text="Length scale")
-        self.piper_length_scale_label.grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_length_scale_label.grid(row=6, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
         self.piper_length_scale_entry = ttk.Entry(opts, textvariable=self.piper_length_scale_var)
-        self.piper_length_scale_entry.grid(row=3, column=3, sticky="ew", pady=(8, 0))
+        self.piper_length_scale_entry.grid(row=6, column=3, sticky="ew", pady=(8, 0))
         self.piper_noise_scale_label = ttk.Label(opts, text="Noise scale")
-        self.piper_noise_scale_label.grid(row=3, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_noise_scale_label.grid(row=6, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
         self.piper_noise_scale_entry = ttk.Entry(opts, textvariable=self.piper_noise_scale_var)
-        self.piper_noise_scale_entry.grid(row=3, column=5, sticky="ew", pady=(8, 0))
+        self.piper_noise_scale_entry.grid(row=6, column=5, sticky="ew", pady=(8, 0))
 
         self.piper_noise_w_label = ttk.Label(opts, text="Noise W")
-        self.piper_noise_w_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.piper_noise_w_label.grid(row=7, column=0, sticky="w", pady=(8, 0))
         self.piper_noise_w_entry = ttk.Entry(opts, textvariable=self.piper_noise_w_var)
-        self.piper_noise_w_entry.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        self.piper_noise_w_entry.grid(row=7, column=1, sticky="ew", pady=(8, 0))
         self.piper_sentence_silence_label = ttk.Label(opts, text="Sentence silence")
-        self.piper_sentence_silence_label.grid(row=4, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_sentence_silence_label.grid(row=7, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
         self.piper_sentence_silence_entry = ttk.Entry(opts, textvariable=self.piper_sentence_silence_var)
-        self.piper_sentence_silence_entry.grid(row=4, column=3, sticky="ew", pady=(8, 0))
+        self.piper_sentence_silence_entry.grid(row=7, column=3, sticky="ew", pady=(8, 0))
 
         body = ttk.Panedwindow(self, orient="vertical")
         body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -357,6 +415,7 @@ class TTSGui(tk.Tk):
         player_buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(player_buttons, text="Play", command=self.play_current_audio).pack(side="left")
         ttk.Button(player_buttons, text="Stop", command=self.stop_current_audio).pack(side="left", padx=(8, 0))
+        ttk.Button(player_buttons, text="Save", command=self.save_current_audio).pack(side="left", padx=(8, 0))
         ttk.Label(player_buttons, textvariable=self.timeline_label_var).pack(side="right")
 
         self.timeline_canvas = tk.Canvas(player_frame, height=24, highlightthickness=1, highlightbackground="#808080")
@@ -364,12 +423,18 @@ class TTSGui(tk.Tk):
         self.timeline_canvas.bind("<Configure>", lambda _event: self._draw_timeline())
         self.timeline_canvas.bind("<Button-1>", self._seek_timeline)
 
+        save_row = ttk.Frame(player_frame)
+        save_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        save_row.columnconfigure(1, weight=1)
+        ttk.Label(save_row, text="Save as").grid(row=0, column=0, sticky="w")
+        self.save_entry = ttk.Entry(save_row, textvariable=self.save_path_var)
+        self.save_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_box = ScrolledText(log_frame, wrap="word", height=10, state="disabled")
         self.log_box.grid(row=0, column=0, sticky="nsew")
 
-        self._sync_output_widgets()
         self._sync_option_visibility()
 
     def _refresh_voice_lists(self) -> None:
@@ -424,10 +489,6 @@ class TTSGui(tk.Tk):
         finally:
             self.after(3000, self._periodic_status_refresh)
 
-    def _sync_output_widgets(self) -> None:
-        state = "normal" if self.save_output_var.get() else "disabled"
-        self.output_entry.configure(state=state)
-
     def _set_widget_group_visible(self, widgets: tuple[tk.Widget, ...], visible: bool) -> None:
         for widget in widgets:
             if visible:
@@ -435,13 +496,45 @@ class TTSGui(tk.Tk):
             else:
                 widget.grid_remove()
 
+    def _apply_engine_defaults(self, engine: str) -> None:
+        defaults = ENGINE_DEFAULTS.get(engine, {})
+        if "no_speaker" in defaults:
+            self.no_speaker_var.set(bool(defaults["no_speaker"]))
+        self.prompt_var.set(str(defaults.get("prompt_text", "")))
+        self.chunk_length_var.set(str(defaults.get("chunk_length", "")))
+        self.temperature_var.set(str(defaults.get("temperature", "")))
+        self.top_p_var.set(str(defaults.get("top_p", "")))
+        self.repetition_penalty_var.set(str(defaults.get("repetition_penalty", "")))
+        self.max_new_tokens_var.set(str(defaults.get("max_new_tokens", "")))
+        self.max_length_var.set(str(defaults.get("max_length", "")))
+        self.split_sentences_var.set(bool(defaults.get("split_sentences", True)))
+        self.chunk_chars_var.set(str(defaults.get("chunk_chars", "")))
+        self.speaker_seconds_var.set(str(defaults.get("speaker_seconds", "")))
+        self.speaker_offset_var.set(str(defaults.get("speaker_offset", "")))
+        self.piper_speaker_id_var.set(str(defaults.get("speaker_id", "0")))
+        self.piper_length_scale_var.set(str(defaults.get("length_scale", "")))
+        self.piper_noise_scale_var.set(str(defaults.get("noise_scale", "")))
+        self.piper_noise_w_var.set(str(defaults.get("noise_w", "")))
+        self.piper_sentence_silence_var.set(str(defaults.get("sentence_silence", "")))
+        if engine == "piper" and self.piper_model_combo["values"] and not self.piper_model_var.get().strip():
+            models = list(self.piper_model_combo["values"])
+            preferred = next((p for p in models if "de_DE-thorsten-high" in p), models[0])
+            self.piper_model_var.set(preferred)
+
+    def _on_engine_changed(self) -> None:
+        engine = self.engine_var.get().strip() or "auto"
+        self._apply_engine_defaults(engine)
+        self._sync_option_visibility()
+
     def _sync_option_visibility(self) -> None:
         engine = self.engine_var.get().strip() or "auto"
         show_ref = engine in {"index", "fish", "cosy", "miotts"}
         show_no_speaker = engine in {"fish", "cosy"}
         show_prompt = engine in {"fish", "cosy"}
         show_chunk = engine == "fish"
-        show_style = False
+        show_fish_sampling = engine == "fish"
+        show_fish_chunking = engine == "fish"
+        show_fish_ref_window = engine == "fish"
         show_piper = engine == "piper"
 
         self._set_widget_group_visible(
@@ -449,9 +542,17 @@ class TTSGui(tk.Tk):
             show_ref,
         )
         self._set_widget_group_visible((self.no_speaker_check,), show_no_speaker)
-        self._set_widget_group_visible((self.style_label, self.style_entry), show_style)
         self._set_widget_group_visible((self.prompt_label, self.prompt_entry), show_prompt)
         self._set_widget_group_visible((self.chunk_label, self.chunk_entry), show_chunk)
+        self._set_widget_group_visible((self.temperature_label, self.temperature_entry), show_fish_sampling)
+        self._set_widget_group_visible((self.top_p_label, self.top_p_entry), show_fish_sampling)
+        self._set_widget_group_visible((self.repetition_penalty_label, self.repetition_penalty_entry), show_fish_sampling)
+        self._set_widget_group_visible((self.max_new_tokens_label, self.max_new_tokens_entry), show_fish_sampling)
+        self._set_widget_group_visible((self.max_length_label, self.max_length_entry), show_fish_sampling)
+        self._set_widget_group_visible((self.split_sentences_check,), show_fish_chunking)
+        self._set_widget_group_visible((self.chunk_chars_label, self.chunk_chars_entry), show_fish_chunking)
+        self._set_widget_group_visible((self.speaker_seconds_label, self.speaker_seconds_entry), show_fish_ref_window)
+        self._set_widget_group_visible((self.speaker_offset_label, self.speaker_offset_entry), show_fish_ref_window)
         self._set_widget_group_visible((self.piper_model_label, self.piper_model_combo), show_piper)
         self._set_widget_group_visible(
             (
@@ -761,6 +862,8 @@ class TTSGui(tk.Tk):
             self.server_detail_var.set(
                 f"Loaded: {', '.join(loaded) or '-'} | Resident: {resident}{current_text}"
             )
+            if not self.busy and isinstance(current_request, dict) and current_request.get("engine"):
+                self.active_label_var.set(f"Server busy: {current_request.get('engine')}")
         else:
             host, port, _ = tts_endpoint()
             self.server_status_var.set(f"Server: not running on {host}:{port}")
@@ -810,8 +913,26 @@ class TTSGui(tk.Tk):
                     args.extend(["--speaker", speaker])
             if self.prompt_var.get().strip():
                 args.extend(["--prompt-text", self.prompt_var.get().strip()])
-            if engine == "fish" and self.chunk_length_var.get().strip():
-                args.extend(["--chunk-length", self.chunk_length_var.get().strip()])
+            if engine == "fish":
+                if self.chunk_length_var.get().strip():
+                    args.extend(["--chunk-length", self.chunk_length_var.get().strip()])
+                if self.temperature_var.get().strip():
+                    args.extend(["--temperature", self.temperature_var.get().strip()])
+                if self.top_p_var.get().strip():
+                    args.extend(["--top-p", self.top_p_var.get().strip()])
+                if self.repetition_penalty_var.get().strip():
+                    args.extend(["--repetition-penalty", self.repetition_penalty_var.get().strip()])
+                if self.max_new_tokens_var.get().strip():
+                    args.extend(["--max-new-tokens", self.max_new_tokens_var.get().strip()])
+                if self.max_length_var.get().strip():
+                    args.extend(["--max-length", self.max_length_var.get().strip()])
+                args.append("--split" if self.split_sentences_var.get() else "--no-split")
+                if self.chunk_chars_var.get().strip():
+                    args.extend(["--chunk-chars", self.chunk_chars_var.get().strip()])
+                if self.speaker_seconds_var.get().strip():
+                    args.extend(["--speaker-seconds", self.speaker_seconds_var.get().strip()])
+                if self.speaker_offset_var.get().strip():
+                    args.extend(["--speaker-offset", self.speaker_offset_var.get().strip()])
         elif engine == "piper":
             if self.piper_model_var.get().strip():
                 args.extend(["--model", self.piper_model_var.get().strip()])
@@ -828,13 +949,22 @@ class TTSGui(tk.Tk):
         return args
 
     def _output_target(self) -> tuple[Path, bool]:
-        if self.save_output_var.get():
-            output = Path(self.output_path_var.get().strip() or "/data/tmp/tts_gui.wav").expanduser()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            return output, False
-        fd, tmp_name = tempfile.mkstemp(prefix="tts_gui_", suffix=".wav", dir=TMP_ROOT)
+        tmp_root = RAM_TMP_ROOT if RAM_TMP_ROOT.is_dir() else TMP_ROOT
+        fd, tmp_name = tempfile.mkstemp(prefix="tts_gui_", suffix=".wav", dir=tmp_root)
         os.close(fd)
         return Path(tmp_name), True
+
+    def save_current_audio(self) -> None:
+        if self.current_audio_path is None or not self.current_audio_path.exists():
+            self._log("No rendered audio available", "WARN")
+            return
+        try:
+            target = Path(self.save_path_var.get().strip() or "/data/tmp/tts_gui.wav").expanduser()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.current_audio_path, target)
+            self._log(f"Saved audio to {target}")
+        except Exception as exc:  # noqa: BLE001
+            self._log(str(exc), "ERROR")
 
     def speak_selected_mode(self) -> None:
         self.speak(self.mode_var.get())
@@ -844,10 +974,6 @@ class TTSGui(tk.Tk):
         if not text:
             messagebox.showerror("TTS GUI", "Text is empty.")
             return
-
-        engine = self.engine_var.get().strip() or "auto"
-        if engine != "piper" and self.piper_model_var.get().strip():
-            self._log("Piper model selection only applies when engine is set to piper", "WARN")
 
         if mode == "server":
             self._speak_server(text)
