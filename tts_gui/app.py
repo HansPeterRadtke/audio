@@ -28,7 +28,6 @@ PORTS_PATH = DATA_ROOT / "etc" / "ports.json"
 TMP_ROOT = DATA_ROOT / "var" / "tmp" / "tts_gui"
 
 ENGINE_OPTIONS = ("auto", "index", "fish", "cosy", "miotts", "piper")
-LANGUAGE_OPTIONS = ("auto", "de", "en")
 
 
 def bootstrap_audio_env() -> None:
@@ -187,12 +186,13 @@ class TTSGui(tk.Tk):
         TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.ui_queue: queue.Queue[Any] = queue.Queue()
         self.busy = False
 
         self.engine_var = tk.StringVar(value="auto")
-        self.lang_var = tk.StringVar(value="auto")
         self.mode_var = tk.StringVar(value="server")
         self.no_speaker_var = tk.BooleanVar(value=False)
+        self.save_output_var = tk.BooleanVar(value=False)
         self.style_var = tk.StringVar()
         self.prompt_var = tk.StringVar()
         self.chunk_length_var = tk.StringVar()
@@ -203,13 +203,18 @@ class TTSGui(tk.Tk):
         self.piper_noise_w_var = tk.StringVar()
         self.piper_sentence_silence_var = tk.StringVar()
         self.speaker_var = tk.StringVar()
+        self.output_path_var = tk.StringVar(value="/data/tmp/tts_gui.wav")
         self.server_status_var = tk.StringVar(value="Server: checking...")
         self.server_detail_var = tk.StringVar(value="")
         self.sink_var = tk.StringVar(value=f"Sink: {current_sink_name()}")
+        self.active_label_var = tk.StringVar(value="Idle")
         self.audio_status_var = tk.StringVar(value="Audio: none")
         self.playback_status_var = tk.StringVar(value="Playback: stopped")
         self.timeline_label_var = tk.StringVar(value="00:00 / 00:00")
         self.health_data: dict[str, Any] | None = None
+        self.active_proc: subprocess.Popen[str] | None = None
+        self.active_kind: str | None = None
+        self.cancel_requested = False
         self.current_audio_path: Path | None = None
         self.current_audio_is_temporary = False
         self.current_audio_duration = 0.0
@@ -220,8 +225,11 @@ class TTSGui(tk.Tk):
 
         self._build_ui()
         self._refresh_voice_lists()
+        self.engine_var.trace_add("write", lambda *_: self._sync_option_visibility())
+        self.no_speaker_var.trace_add("write", lambda *_: self._sync_option_visibility())
+        self.save_output_var.trace_add("write", lambda *_: self._sync_output_widgets())
         self.after(100, self._poll_log_queue)
-        self.after(150, self.refresh_status)
+        self.after(150, self._periodic_status_refresh)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
@@ -237,12 +245,17 @@ class TTSGui(tk.Tk):
         )
         ttk.Label(top, textvariable=self.server_detail_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(top, textvariable=self.sink_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, textvariable=self.active_label_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
 
         btns = ttk.Frame(top)
-        btns.grid(row=0, column=1, rowspan=3, sticky="e")
+        btns.grid(row=0, column=1, rowspan=4, sticky="e")
         ttk.Button(btns, text="Refresh", command=self.refresh_status).grid(row=0, column=0, padx=4)
         ttk.Button(btns, text="Start Server", command=self.start_server).grid(row=0, column=1, padx=4)
         ttk.Button(btns, text="Stop Server", command=self.stop_server).grid(row=0, column=2, padx=4)
+        ttk.Button(btns, text="Stop Current", command=self.stop_current_action).grid(row=0, column=3, padx=4)
+
+        self.progress = ttk.Progressbar(top, mode="indeterminate")
+        self.progress.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         opts = ttk.LabelFrame(self, text="Options", padding=12)
         opts.grid(row=1, column=0, sticky="ew", padx=12)
@@ -256,43 +269,62 @@ class TTSGui(tk.Tk):
         ttk.Radiobutton(mode_box, text="One-shot", variable=self.mode_var, value="oneshot").pack(side="left", padx=(8, 0))
 
         ttk.Label(opts, text="Engine").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        ttk.Combobox(opts, textvariable=self.engine_var, values=ENGINE_OPTIONS, state="readonly").grid(
-            row=0, column=3, sticky="ew"
-        )
+        self.engine_combo = ttk.Combobox(opts, textvariable=self.engine_var, values=ENGINE_OPTIONS, state="readonly")
+        self.engine_combo.grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(opts, text="Language").grid(row=0, column=4, sticky="w", padx=(12, 0))
-        ttk.Combobox(opts, textvariable=self.lang_var, values=LANGUAGE_OPTIONS, state="readonly").grid(
-            row=0, column=5, sticky="ew"
-        )
+        self.save_output_check = ttk.Checkbutton(opts, text="Save output", variable=self.save_output_var)
+        self.save_output_check.grid(row=0, column=4, sticky="w", padx=(12, 0))
+        self.output_entry = ttk.Entry(opts, textvariable=self.output_path_var)
+        self.output_entry.grid(row=0, column=5, sticky="ew")
 
-        ttk.Label(opts, text="Reference voice").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.speaker_label = ttk.Label(opts, text="Reference voice")
+        self.speaker_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.speaker_combo = ttk.Combobox(opts, textvariable=self.speaker_var, state="readonly")
         self.speaker_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(opts, text="No speaker", variable=self.no_speaker_var).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Button(opts, text="Refresh Voices", command=self._refresh_voice_lists).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        self.no_speaker_check = ttk.Checkbutton(opts, text="No speaker", variable=self.no_speaker_var)
+        self.no_speaker_check.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.refresh_voices_btn = ttk.Button(opts, text="Refresh Voices", command=self._refresh_voice_lists)
+        self.refresh_voices_btn.grid(row=1, column=3, sticky="w", pady=(8, 0))
 
-        ttk.Label(opts, text="Piper model").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_model_label = ttk.Label(opts, text="Piper model")
+        self.piper_model_label.grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
         self.piper_model_combo = ttk.Combobox(opts, textvariable=self.piper_model_var, state="readonly")
         self.piper_model_combo.grid(row=1, column=5, sticky="ew", pady=(8, 0))
 
-        ttk.Label(opts, text="Style").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.style_var).grid(row=2, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(opts, text="Prompt text").grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.prompt_var).grid(row=2, column=3, sticky="ew", pady=(8, 0))
-        ttk.Label(opts, text="Chunk length").grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.chunk_length_var).grid(row=2, column=5, sticky="ew", pady=(8, 0))
+        self.style_label = ttk.Label(opts, text="Style")
+        self.style_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.style_entry = ttk.Entry(opts, textvariable=self.style_var)
+        self.style_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        self.prompt_label = ttk.Label(opts, text="Prompt text")
+        self.prompt_label.grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.prompt_entry = ttk.Entry(opts, textvariable=self.prompt_var)
+        self.prompt_entry.grid(row=2, column=3, sticky="ew", pady=(8, 0))
+        self.chunk_label = ttk.Label(opts, text="Chunk length")
+        self.chunk_label.grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.chunk_entry = ttk.Entry(opts, textvariable=self.chunk_length_var)
+        self.chunk_entry.grid(row=2, column=5, sticky="ew", pady=(8, 0))
 
-        ttk.Label(opts, text="Piper speaker-id").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.piper_speaker_id_var).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(opts, text="Length scale").grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.piper_length_scale_var).grid(row=3, column=3, sticky="ew", pady=(8, 0))
-        ttk.Label(opts, text="Noise scale").grid(row=3, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.piper_noise_scale_var).grid(row=3, column=5, sticky="ew", pady=(8, 0))
+        self.piper_speaker_id_label = ttk.Label(opts, text="Piper speaker-id")
+        self.piper_speaker_id_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.piper_speaker_id_entry = ttk.Entry(opts, textvariable=self.piper_speaker_id_var)
+        self.piper_speaker_id_entry.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.piper_length_scale_label = ttk.Label(opts, text="Length scale")
+        self.piper_length_scale_label.grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_length_scale_entry = ttk.Entry(opts, textvariable=self.piper_length_scale_var)
+        self.piper_length_scale_entry.grid(row=3, column=3, sticky="ew", pady=(8, 0))
+        self.piper_noise_scale_label = ttk.Label(opts, text="Noise scale")
+        self.piper_noise_scale_label.grid(row=3, column=4, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_noise_scale_entry = ttk.Entry(opts, textvariable=self.piper_noise_scale_var)
+        self.piper_noise_scale_entry.grid(row=3, column=5, sticky="ew", pady=(8, 0))
 
-        ttk.Label(opts, text="Noise W").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.piper_noise_w_var).grid(row=4, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(opts, text="Sentence silence").grid(row=4, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Entry(opts, textvariable=self.piper_sentence_silence_var).grid(row=4, column=3, sticky="ew", pady=(8, 0))
+        self.piper_noise_w_label = ttk.Label(opts, text="Noise W")
+        self.piper_noise_w_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.piper_noise_w_entry = ttk.Entry(opts, textvariable=self.piper_noise_w_var)
+        self.piper_noise_w_entry.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        self.piper_sentence_silence_label = ttk.Label(opts, text="Sentence silence")
+        self.piper_sentence_silence_label.grid(row=4, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.piper_sentence_silence_entry = ttk.Entry(opts, textvariable=self.piper_sentence_silence_var)
+        self.piper_sentence_silence_entry.grid(row=4, column=3, sticky="ew", pady=(8, 0))
 
         body = ttk.Panedwindow(self, orient="vertical")
         body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -337,6 +369,9 @@ class TTSGui(tk.Tk):
         self.log_box = ScrolledText(log_frame, wrap="word", height=10, state="disabled")
         self.log_box.grid(row=0, column=0, sticky="nsew")
 
+        self._sync_output_widgets()
+        self._sync_option_visibility()
+
     def _refresh_voice_lists(self) -> None:
         speakers = list_reference_voices()
         self.speaker_combo["values"] = speakers
@@ -352,6 +387,9 @@ class TTSGui(tk.Tk):
     def _log(self, message: str, level: str = "INFO") -> None:
         self.log_queue.put((level, message))
 
+    def _ui_call(self, fn: Any) -> None:
+        self.ui_queue.put(fn)
+
     def _poll_log_queue(self) -> None:
         try:
             while True:
@@ -363,10 +401,73 @@ class TTSGui(tk.Tk):
                 self.log_box.configure(state="disabled")
         except queue.Empty:
             pass
+        try:
+            while True:
+                fn = self.ui_queue.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
         self.after(120, self._poll_log_queue)
 
     def _set_busy(self, value: bool) -> None:
         self.busy = value
+        if value:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            if self.play_proc is None or self.play_proc.poll() is not None:
+                self.active_label_var.set("Idle")
+
+    def _periodic_status_refresh(self) -> None:
+        try:
+            self.refresh_status()
+        finally:
+            self.after(3000, self._periodic_status_refresh)
+
+    def _sync_output_widgets(self) -> None:
+        state = "normal" if self.save_output_var.get() else "disabled"
+        self.output_entry.configure(state=state)
+
+    def _set_widget_group_visible(self, widgets: tuple[tk.Widget, ...], visible: bool) -> None:
+        for widget in widgets:
+            if visible:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _sync_option_visibility(self) -> None:
+        engine = self.engine_var.get().strip() or "auto"
+        show_ref = engine in {"index", "fish", "cosy", "miotts"}
+        show_no_speaker = engine in {"fish", "cosy"}
+        show_prompt = engine in {"fish", "cosy"}
+        show_chunk = engine == "fish"
+        show_style = False
+        show_piper = engine == "piper"
+
+        self._set_widget_group_visible(
+            (self.speaker_label, self.speaker_combo, self.refresh_voices_btn),
+            show_ref,
+        )
+        self._set_widget_group_visible((self.no_speaker_check,), show_no_speaker)
+        self._set_widget_group_visible((self.style_label, self.style_entry), show_style)
+        self._set_widget_group_visible((self.prompt_label, self.prompt_entry), show_prompt)
+        self._set_widget_group_visible((self.chunk_label, self.chunk_entry), show_chunk)
+        self._set_widget_group_visible((self.piper_model_label, self.piper_model_combo), show_piper)
+        self._set_widget_group_visible(
+            (
+                self.piper_speaker_id_label,
+                self.piper_speaker_id_entry,
+                self.piper_length_scale_label,
+                self.piper_length_scale_entry,
+                self.piper_noise_scale_label,
+                self.piper_noise_scale_entry,
+                self.piper_noise_w_label,
+                self.piper_noise_w_entry,
+                self.piper_sentence_silence_label,
+                self.piper_sentence_silence_entry,
+            ),
+            show_piper,
+        )
 
     def _current_play_position(self) -> float:
         position = self.play_offset
@@ -457,6 +558,8 @@ class TTSGui(tk.Tk):
             self._set_audio_status(self.current_audio_path)
         else:
             self.playback_status_var.set("Playback: stopped")
+        if not self.busy:
+            self.active_label_var.set("Idle")
         self._draw_timeline()
 
     def _poll_playback(self) -> None:
@@ -484,6 +587,7 @@ class TTSGui(tk.Tk):
         )
         self.play_offset = offset
         self.play_started_at = time.monotonic()
+        self.active_label_var.set("Playing audio")
         self.playback_status_var.set("Playback: playing")
         self._draw_timeline()
         self._poll_playback()
@@ -519,6 +623,8 @@ class TTSGui(tk.Tk):
             self.playback_status_var.set("Playback: stopped")
         else:
             self.playback_status_var.set("Playback: paused")
+        if not self.busy:
+            self.active_label_var.set("Idle" if self.play_proc is None else "Playing audio")
         if self.current_audio_path is not None:
             self._set_audio_status(self.current_audio_path)
         else:
@@ -542,41 +648,118 @@ class TTSGui(tk.Tk):
             except Exception as exc:  # noqa: BLE001
                 self._log(str(exc), "ERROR")
 
-    def _run_async(self, fn, *, success_message: str | None = None, refresh_after: bool = False) -> None:
+    def _stream_reader(self, pipe: Any, level: str) -> None:
+        try:
+            for line in iter(pipe.readline, ""):
+                line = line.rstrip()
+                if line:
+                    self._log(line, level)
+        finally:
+            pipe.close()
+
+    def _run_popen(
+        self,
+        cmd: list[str],
+        *,
+        label: str,
+        kind: str,
+        env: dict[str, str] | None = None,
+        after_success: Any = None,
+        refresh_after: bool = False,
+        stop_server_on_cancel: bool = False,
+        cleanup_path: Path | None = None,
+        cleanup_on_error: bool = False,
+    ) -> None:
         if self.busy:
             self._log("A TTS action is already running", "WARN")
             return
         self._set_busy(True)
+        self.active_kind = kind
+        self.active_label_var.set(label)
+        self.cancel_requested = False
 
         def worker() -> None:
+            proc: subprocess.Popen[str] | None = None
             try:
-                fn()
-                if success_message:
-                    self._log(success_message)
-            except subprocess.CalledProcessError as exc:
-                err = (exc.stderr or exc.stdout or str(exc)).strip()
-                self._log(err or f"command failed: {exc}", "ERROR")
+                self._log("CMD: " + " ".join(cmd))
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env or os.environ.copy(),
+                )
+                self.active_proc = proc
+                if proc.stdout is not None:
+                    threading.Thread(target=self._stream_reader, args=(proc.stdout, "INFO"), daemon=True).start()
+                if proc.stderr is not None:
+                    threading.Thread(target=self._stream_reader, args=(proc.stderr, "ERROR"), daemon=True).start()
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError(f"{label} failed with exit code {rc}")
+                if after_success is not None:
+                    after_success()
             except Exception as exc:  # noqa: BLE001
+                if cleanup_on_error and cleanup_path is not None:
+                    try:
+                        cleanup_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 self._log(str(exc), "ERROR")
             finally:
-                self.after(0, lambda: self._set_busy(False))
+                self.active_proc = None
+                if stop_server_on_cancel and self.cancel_requested:
+                    try:
+                        proc2 = subprocess.run(
+                            [str(BIN_ROOT / "stop_tts.sh")],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=os.environ.copy(),
+                        )
+                        msg = ((proc2.stdout or "") + (proc2.stderr or "")).strip()
+                        if msg:
+                            self._log(msg)
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(f"forced stop failed: {exc}", "ERROR")
+                self.cancel_requested = False
+                self.active_kind = None
+                self._ui_call(lambda: self._set_busy(False))
                 if refresh_after:
-                    self.after(0, self.refresh_status)
+                    self._ui_call(self.refresh_status)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def stop_current_action(self) -> None:
+        if self.play_proc is not None and self.play_proc.poll() is None:
+            self._log("Stopping current playback", "WARN")
+            self.stop_current_audio(reset_position=False)
+            return
+        proc = self.active_proc
+        if proc is None or proc.poll() is not None:
+            self._log("No running action to stop", "WARN")
+            return
+        self.cancel_requested = True
+        self._log(f"Stopping current action: {self.active_kind or 'process'}", "WARN")
+        try:
+            proc.terminate()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"terminate failed: {exc}", "ERROR")
 
     def refresh_status(self) -> None:
         self.sink_var.set(f"Sink: {current_sink_name()}")
         health = server_health()
         self.health_data = health
         if health:
-            engines = ", ".join(health.get("available_engines") or [])
             loaded = [k for k, v in (health.get("loaded") or {}).items() if v]
+            resident = ", ".join(health.get("resident_loaded") or []) or "-"
+            current_request = health.get("current_request")
+            current_text = f" | Current: {current_request.get('engine')}" if isinstance(current_request, dict) and current_request.get("engine") else ""
             self.server_status_var.set(
                 f"Server: running on {health.get('host')} pid={health.get('pid')} device={health.get('device')}"
             )
             self.server_detail_var.set(
-                f"Available: {engines or '-'} | Loaded: {', '.join(loaded) or '-'}"
+                f"Loaded: {', '.join(loaded) or '-'} | Resident: {resident}{current_text}"
             )
         else:
             host, port, _ = tts_endpoint()
@@ -584,36 +767,28 @@ class TTSGui(tk.Tk):
             self.server_detail_var.set("")
 
     def start_server(self) -> None:
-        def run() -> None:
-            proc = subprocess.run(
-                [str(BIN_ROOT / "tts.sh")],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-            out = (proc.stdout or "") + (proc.stderr or "")
-            if proc.returncode != 0:
-                raise RuntimeError(out.strip() or "tts.sh failed")
-            self._log((out.strip() or "tts server started").splitlines()[-1])
-
-        self._run_async(run, refresh_after=True)
+        env = os.environ.copy()
+        selected_engine = self.engine_var.get().strip() or "auto"
+        if selected_engine != "auto":
+            env["TTS_PRELOAD"] = selected_engine
+        else:
+            env.pop("TTS_PRELOAD", None)
+        self._run_popen(
+            [str(BIN_ROOT / "tts.sh")],
+            label="Starting server",
+            kind="server_start",
+            env=env,
+            refresh_after=True,
+            stop_server_on_cancel=True,
+        )
 
     def stop_server(self) -> None:
-        def run() -> None:
-            proc = subprocess.run(
-                [str(BIN_ROOT / "stop_tts.sh")],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-            out = (proc.stdout or "") + (proc.stderr or "")
-            if proc.returncode != 0:
-                raise RuntimeError(out.strip() or "stop_tts.sh failed")
-            self._log((out.strip() or "tts server stopped").splitlines()[-1])
-
-        self._run_async(run, refresh_after=True)
+        self._run_popen(
+            [str(BIN_ROOT / "stop_tts.sh")],
+            label="Stopping server",
+            kind="server_stop",
+            refresh_after=True,
+        )
 
     def _text_value(self) -> str:
         return self.text_box.get("1.0", "end").strip()
@@ -622,35 +797,44 @@ class TTSGui(tk.Tk):
         args: list[str] = []
         engine = self.engine_var.get().strip() or "auto"
         args.extend(["--engine", engine])
-        lang = self.lang_var.get().strip() or "auto"
-        args.extend(["--lang", lang])
-
-        if self.no_speaker_var.get():
-            args.extend(["--speaker", "none"])
-        else:
+        if engine in {"index", "miotts"}:
             speaker = self.speaker_var.get().strip()
             if speaker:
                 args.extend(["--speaker", speaker])
-
-        if self.style_var.get().strip():
-            args.extend(["--style", self.style_var.get().strip()])
-        if self.prompt_var.get().strip():
-            args.extend(["--prompt-text", self.prompt_var.get().strip()])
-        if self.chunk_length_var.get().strip():
-            args.extend(["--chunk-length", self.chunk_length_var.get().strip()])
-        if self.piper_model_var.get().strip():
-            args.extend(["--model", self.piper_model_var.get().strip()])
-        if self.piper_speaker_id_var.get().strip():
-            args.extend(["--speaker-id", self.piper_speaker_id_var.get().strip()])
-        if self.piper_length_scale_var.get().strip():
-            args.extend(["--length-scale", self.piper_length_scale_var.get().strip()])
-        if self.piper_noise_scale_var.get().strip():
-            args.extend(["--noise-scale", self.piper_noise_scale_var.get().strip()])
-        if self.piper_noise_w_var.get().strip():
-            args.extend(["--noise-w", self.piper_noise_w_var.get().strip()])
-        if self.piper_sentence_silence_var.get().strip():
-            args.extend(["--sentence-silence", self.piper_sentence_silence_var.get().strip()])
+        elif engine in {"fish", "cosy"}:
+            if self.no_speaker_var.get():
+                args.extend(["--speaker", "none"])
+            else:
+                speaker = self.speaker_var.get().strip()
+                if speaker:
+                    args.extend(["--speaker", speaker])
+            if self.prompt_var.get().strip():
+                args.extend(["--prompt-text", self.prompt_var.get().strip()])
+            if engine == "fish" and self.chunk_length_var.get().strip():
+                args.extend(["--chunk-length", self.chunk_length_var.get().strip()])
+        elif engine == "piper":
+            if self.piper_model_var.get().strip():
+                args.extend(["--model", self.piper_model_var.get().strip()])
+            if self.piper_speaker_id_var.get().strip():
+                args.extend(["--speaker-id", self.piper_speaker_id_var.get().strip()])
+            if self.piper_length_scale_var.get().strip():
+                args.extend(["--length-scale", self.piper_length_scale_var.get().strip()])
+            if self.piper_noise_scale_var.get().strip():
+                args.extend(["--noise-scale", self.piper_noise_scale_var.get().strip()])
+            if self.piper_noise_w_var.get().strip():
+                args.extend(["--noise-w", self.piper_noise_w_var.get().strip()])
+            if self.piper_sentence_silence_var.get().strip():
+                args.extend(["--sentence-silence", self.piper_sentence_silence_var.get().strip()])
         return args
+
+    def _output_target(self) -> tuple[Path, bool]:
+        if self.save_output_var.get():
+            output = Path(self.output_path_var.get().strip() or "/data/tmp/tts_gui.wav").expanduser()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            return output, False
+        fd, tmp_name = tempfile.mkstemp(prefix="tts_gui_", suffix=".wav", dir=TMP_ROOT)
+        os.close(fd)
+        return Path(tmp_name), True
 
     def speak_selected_mode(self) -> None:
         self.speak(self.mode_var.get())
@@ -661,66 +845,54 @@ class TTSGui(tk.Tk):
             messagebox.showerror("TTS GUI", "Text is empty.")
             return
 
+        engine = self.engine_var.get().strip() or "auto"
+        if engine != "piper" and self.piper_model_var.get().strip():
+            self._log("Piper model selection only applies when engine is set to piper", "WARN")
+
         if mode == "server":
-            self._run_async(lambda: self._speak_server(text), success_message="Server synthesis completed", refresh_after=True)
+            self._speak_server(text)
         else:
-            self._run_async(lambda: self._speak_oneshot(text), success_message="One-shot synthesis completed")
+            self._speak_oneshot(text)
 
     def _speak_oneshot(self, text: str) -> None:
-        fd, tmp_name = tempfile.mkstemp(prefix="tts_gui_", suffix=".wav", dir=TMP_ROOT)
-        os.close(fd)
-        tmp_path = Path(tmp_name)
+        tmp_path, temporary = self._output_target()
         cmd = [str(BIN_ROOT / "tts_once.sh"), "-o", str(tmp_path), *self._base_args(), text]
-        self._log("Running one-shot TTS")
-        try:
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-            if proc.returncode != 0:
-                raise RuntimeError((proc.stderr or proc.stdout or "").strip() or "tts_once.sh failed")
-            out = (proc.stdout or "").strip()
-            if out:
-                self._log(out)
-            self.after(0, lambda path=tmp_path: self._load_and_play_audio(path))
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        def after_success() -> None:
+            self._ui_call(lambda path=tmp_path, keep=temporary: self._load_and_play_audio(path, keep))
+
+        self._run_popen(
+            cmd,
+            label="Running one-shot TTS",
+            kind="oneshot_speak",
+            after_success=after_success,
+            cleanup_path=tmp_path,
+            cleanup_on_error=temporary,
+        )
 
     def _speak_server(self, text: str) -> None:
         health = server_health()
         if not health:
             raise RuntimeError("TTS server is not running")
 
-        fd, tmp_name = tempfile.mkstemp(prefix="tts_gui_", suffix=".wav", dir=TMP_ROOT)
-        os.close(fd)
-        tmp_path = Path(tmp_name)
+        tmp_path, temporary = self._output_target()
+        cmd = [str(BIN_ROOT / "call_tts.sh"), "-o", str(tmp_path), *self._base_args(), text]
 
-        try:
-            cmd = [str(BIN_ROOT / "call_tts.sh"), "-o", str(tmp_path), *self._base_args(), text]
-            self._log("Running server TTS")
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-            if proc.returncode != 0:
-                raise RuntimeError((proc.stderr or proc.stdout or "").strip() or "call_tts.sh failed")
-            out = (proc.stdout or "").strip()
-            if out:
-                self._log(out)
-            self.after(0, lambda path=tmp_path: self._load_and_play_audio(path))
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        def after_success() -> None:
+            self._ui_call(lambda path=tmp_path, keep=temporary: self._load_and_play_audio(path, keep))
 
-    def _load_and_play_audio(self, path: Path) -> None:
-        self._load_audio(path, temporary=True)
+        self._run_popen(
+            cmd,
+            label="Running server TTS",
+            kind="server_speak",
+            after_success=after_success,
+            refresh_after=True,
+            stop_server_on_cancel=True,
+            cleanup_path=tmp_path,
+            cleanup_on_error=temporary,
+        )
+
+    def _load_and_play_audio(self, path: Path, temporary: bool) -> None:
+        self._load_audio(path, temporary=temporary)
         try:
             self._start_playback(0.0)
         except Exception as exc:  # noqa: BLE001
@@ -729,6 +901,12 @@ class TTSGui(tk.Tk):
             self._log(str(exc), "ERROR")
 
     def _on_close(self) -> None:
+        proc = self.active_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         self._reset_audio()
         self.destroy()
 
