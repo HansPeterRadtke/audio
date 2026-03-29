@@ -195,6 +195,16 @@ def list_reference_voices() -> list[str]:
     return [str(p) for p in candidates]
 
 
+def speaker_prompt_path(speaker_path: str) -> Path | None:
+    if not speaker_path:
+        return None
+    path = Path(speaker_path)
+    prompt_path = path.with_suffix(".txt")
+    if prompt_path.is_file():
+        return prompt_path
+    return None
+
+
 class TTSGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -214,6 +224,7 @@ class TTSGui(tk.Tk):
         self.mode_var = tk.StringVar(value="server")
         self.no_speaker_var = tk.BooleanVar(value=False)
         self.prompt_var = tk.StringVar()
+        self.prompt_file_var = tk.StringVar(value="")
         self.chunk_length_var = tk.StringVar()
         self.temperature_var = tk.StringVar()
         self.top_p_var = tk.StringVar()
@@ -256,7 +267,8 @@ class TTSGui(tk.Tk):
         self._apply_engine_defaults(self.engine_var.get().strip() or "auto")
         self._sync_option_visibility()
         self.engine_var.trace_add("write", lambda *_: self._on_engine_changed())
-        self.no_speaker_var.trace_add("write", lambda *_: self._sync_option_visibility())
+        self.no_speaker_var.trace_add("write", lambda *_: self._on_speaker_mode_changed())
+        self.speaker_var.trace_add("write", lambda *_: self._on_speaker_changed())
         self.after(100, self._poll_log_queue)
         self.after(150, self._periodic_status_refresh)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -315,10 +327,10 @@ class TTSGui(tk.Tk):
         self.piper_model_combo = ttk.Combobox(opts, textvariable=self.piper_model_var, state="readonly")
         self.piper_model_combo.grid(row=1, column=5, sticky="ew", pady=(8, 0))
 
-        self.prompt_label = ttk.Label(opts, text="Prompt text")
+        self.prompt_label = ttk.Label(opts, text="Prompt file")
         self.prompt_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.prompt_entry = ttk.Entry(opts, textvariable=self.prompt_var)
-        self.prompt_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        self.prompt_value_label = ttk.Label(opts, textvariable=self.prompt_file_var)
+        self.prompt_value_label.grid(row=2, column=1, sticky="w", pady=(8, 0))
         self.chunk_label = ttk.Label(opts, text="Chunk length")
         self.chunk_label.grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
         self.chunk_entry = ttk.Entry(opts, textvariable=self.chunk_length_var)
@@ -448,6 +460,7 @@ class TTSGui(tk.Tk):
         if piper_models and self.piper_model_var.get() not in piper_models:
             preferred = next((p for p in piper_models if "de_DE-thorsten-high" in p), piper_models[0])
             self.piper_model_var.set(preferred)
+        self._autofill_prompt_for_selected_speaker()
 
     def _log(self, message: str, level: str = "INFO") -> None:
         self.log_queue.put((level, message))
@@ -525,6 +538,37 @@ class TTSGui(tk.Tk):
         engine = self.engine_var.get().strip() or "auto"
         self._apply_engine_defaults(engine)
         self._sync_option_visibility()
+        self._autofill_prompt_for_selected_speaker()
+
+    def _on_speaker_mode_changed(self) -> None:
+        self._sync_option_visibility()
+        self._autofill_prompt_for_selected_speaker()
+
+    def _on_speaker_changed(self) -> None:
+        self._autofill_prompt_for_selected_speaker()
+
+    def _autofill_prompt_for_selected_speaker(self) -> None:
+        engine = self.engine_var.get().strip() or "auto"
+        if engine not in {"fish", "cosy"}:
+            self.prompt_var.set("")
+            self.prompt_file_var.set("")
+            return
+        if self.no_speaker_var.get():
+            self.prompt_var.set("")
+            self.prompt_file_var.set("")
+            return
+        speaker = self.speaker_var.get().strip()
+        prompt_path = speaker_prompt_path(speaker)
+        if prompt_path is None:
+            self.prompt_var.set("")
+            self.prompt_file_var.set("")
+            return
+        try:
+            self.prompt_var.set(prompt_path.read_text(encoding="utf-8").strip())
+            self.prompt_file_var.set(prompt_path.name)
+        except Exception:
+            self.prompt_var.set("")
+            self.prompt_file_var.set("")
 
     def _sync_option_visibility(self) -> None:
         engine = self.engine_var.get().strip() or "auto"
@@ -542,7 +586,7 @@ class TTSGui(tk.Tk):
             show_ref,
         )
         self._set_widget_group_visible((self.no_speaker_check,), show_no_speaker)
-        self._set_widget_group_visible((self.prompt_label, self.prompt_entry), show_prompt)
+        self._set_widget_group_visible((self.prompt_label, self.prompt_value_label), show_prompt)
         self._set_widget_group_visible((self.chunk_label, self.chunk_entry), show_chunk)
         self._set_widget_group_visible((self.temperature_label, self.temperature_entry), show_fish_sampling)
         self._set_widget_group_visible((self.top_p_label, self.top_p_entry), show_fish_sampling)
@@ -911,8 +955,8 @@ class TTSGui(tk.Tk):
                 speaker = self.speaker_var.get().strip()
                 if speaker:
                     args.extend(["--speaker", speaker])
-            if self.prompt_var.get().strip():
-                args.extend(["--prompt-text", self.prompt_var.get().strip()])
+                    if self.prompt_var.get().strip():
+                        args.extend(["--prompt-text", self.prompt_var.get().strip()])
             if engine == "fish":
                 if self.chunk_length_var.get().strip():
                     args.extend(["--chunk-length", self.chunk_length_var.get().strip()])
